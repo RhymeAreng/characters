@@ -1,0 +1,941 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>StillPoint — Character</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#e9e4da;font-family:system-ui,sans-serif;
+            overscroll-behavior:none;-webkit-user-select:none;user-select:none;
+            -webkit-touch-callout:none;-webkit-tap-highlight-color:transparent}
+  @supports (height:100dvh){html,body{height:100dvh}}   /* tracks the mobile browser's collapsing toolbar */
+  /* touch-action:none = the browser may NOT take over drags/pinches for page scroll or zoom */
+  canvas{display:block;touch-action:none}
+  #hud{position:fixed;left:16px;bottom:16px;color:#4a4036;font-size:13px;line-height:1.7;
+       background:rgba(255,255,255,.65);padding:10px 14px;border-radius:10px;backdrop-filter:blur(4px)}
+  #hud b{display:inline-block;min-width:1.6em;text-align:center;background:#fff;border-radius:4px;
+         padding:0 4px;margin-right:2px;box-shadow:0 1px 0 rgba(0,0,0,.18)}
+
+  /* ---- touch UI: only shown when the primary pointer is a finger ---- */
+  #touch{display:none}
+  @media (pointer:coarse){ #hud{display:none} #touch{display:block} }
+  #stick{position:fixed;left:calc(20px + env(safe-area-inset-left));bottom:calc(24px + env(safe-area-inset-bottom));
+         width:132px;height:132px;border-radius:50%;background:rgba(255,255,255,.35);
+         border:2px solid rgba(74,64,54,.25);touch-action:none}
+  #knob{position:absolute;left:50%;top:50%;width:56px;height:56px;margin:-28px 0 0 -28px;border-radius:50%;
+        background:rgba(255,255,255,.85);box-shadow:0 2px 6px rgba(0,0,0,.25);pointer-events:none}
+  #btns{position:fixed;right:calc(16px + env(safe-area-inset-right));bottom:calc(24px + env(safe-area-inset-bottom));
+        display:flex;flex-direction:column;gap:10px;align-items:flex-end}
+  #btns button{font:600 14px system-ui,sans-serif;color:#4a4036;background:rgba(255,255,255,.75);border:0;
+               border-radius:999px;padding:12px 18px;min-width:84px;touch-action:manipulation;
+               box-shadow:0 1px 0 rgba(0,0,0,.18)}
+  #btns button:active{background:#fff}
+  #dbg{position:fixed;left:8px;top:calc(8px + env(safe-area-inset-top));font:11px/1.4 ui-monospace,monospace;
+       color:#4a4036;background:rgba(255,255,255,.7);padding:4px 8px;border-radius:6px;pointer-events:none}
+</style>
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+</script>
+</head>
+<body>
+<div id="hud">
+  <b>W</b><b>A</b><b>S</b><b>D</b> / arrows — walk<br>
+  <b>1</b> stand &nbsp;<b>2</b> kneel &nbsp;<b>3</b> sit &nbsp;<b>G</b> gust of wind<br>
+  drag — orbit camera &nbsp;·&nbsp; scroll — zoom
+</div>
+
+<div id="touch">
+  <div id="stick"><div id="knob"></div></div>
+  <div id="btns">
+    <button data-act="gust">Gust</button>
+    <button data-act="sit">Sit</button>
+    <button data-act="kneel">Kneel</button>
+    <button data-act="idle">Stand</button>
+  </div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+
+// =====================================================================
+// ==== LIB START — everything between here and LIB END is the character
+// =====================================================================
+
+// ---------- small helpers ----------
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const lerp = THREE.MathUtils.lerp;
+
+// Touch-primary devices. Add ?hq to the URL to force the desktop-quality path for A/B comparison.
+const MOBILE = matchMedia('(pointer: coarse)').matches && !location.search.includes('hq');
+// Outline width helper: on mobile, skip outlines on the near-black masses (sleeves, blouse) —
+// the ink line is barely visible against them, and each outline is an extra draw call.
+const OL = (w) => (MOBILE ? 0 : w);
+
+// shortest-angle, frame-rate-independent smoothing
+function dampAngle(cur, target, lambda, dt) {
+  const d = Math.atan2(Math.sin(target - cur), Math.cos(target - cur));
+  return cur + d * (1 - Math.exp(-lambda * dt));
+}
+
+// ---------- palette (from the reference illustration) ----------
+const S = {
+  hair: '#16120f', skin: '#e6b48e', blush: '#e98a7a', blouse: '#1c1a1c',
+  shawl: '#c8481f', gold: '#e8a020', border: '#8f2a14',
+  skirt: '#1f2a5e', red: '#b3202a', hem: '#15151a', silver: '#d8dadc', ink: '#14100e',
+};
+
+// ---------- wind stub (wind.js in the spec) ----------
+let gustAmount = 0;
+function getWind(t) {
+  return {
+    x: Math.sin(t * 0.35) * 0.6 + Math.sin(t * 0.83 + 1.7) * 0.4,
+    z: Math.sin(t * 0.27 + 2.1) * 0.5,
+    strength: 0.35 + 0.15 * Math.sin(t * 0.21 + 0.5) + gustAmount * 0.8, // 0.2–0.5, plus gusts
+  };
+}
+function triggerGust() { gustAmount = 1; }
+function tickWind(dt) { gustAmount = Math.max(0, gustAmount - dt * 0.35); }
+
+// ---------- toon shading ----------
+// 4-band gradient map: dark -> light, nearest filtering gives hard cel bands
+const gradientMap = (() => {
+  const t = new THREE.DataTexture(new Uint8Array([70, 130, 200, 255]), 4, 1, THREE.RedFormat);
+  t.minFilter = t.magFilter = THREE.NearestFilter;
+  t.needsUpdate = true;
+  return t;
+})();
+const toon = (color, extra = {}) => new THREE.MeshToonMaterial({ color, gradientMap, ...extra });
+
+// ---------- outlines: inverted hull, constant width in view space ----------
+// Pushes back faces out along their normals *after* the model-view transform, so the
+// line width stays constant even when a mesh is scaled non-uniformly (skirt kneel/sit).
+const outlineMats = new Map();
+function outlineMaterial(width, color = S.ink) {
+  const key = width + '|' + color;
+  if (!outlineMats.has(key)) {
+    outlineMats.set(key, new THREE.ShaderMaterial({
+      uniforms: { uWidth: { value: width }, uColor: { value: new THREE.Color(color) } },
+      vertexShader: `
+        uniform float uWidth;
+        void main() {
+          vec4 mv = modelViewMatrix * vec4(position, 1.0);
+          vec3 n = normalize(normalMatrix * normal);
+          mv.xyz += n * uWidth;
+          gl_Position = projectionMatrix * mv;
+        }`,
+      fragmentShader: `uniform vec3 uColor; void main() { gl_FragColor = vec4(uColor, 1.0); }`,
+      side: THREE.BackSide,
+    }));
+  }
+  return outlineMats.get(key);
+}
+function mk(geo, mat, outline = 0) {
+  const m = new THREE.Mesh(geo, mat);
+  if (outline) m.add(new THREE.Mesh(geo, outlineMaterial(outline)));
+  return m;
+}
+
+// ---------- procedural textures (no image assets) ----------
+function canvasTex(w, h, draw, repeat = 0) {
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  draw(c.getContext('2d'), w, h);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.anisotropy = 4;
+  if (repeat) { t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(repeat, repeat); }
+  return t;
+}
+
+// Skirt: navy body, red + gold bands, black hem, woven strip at the front seam (u = 0/1)
+const skirtTex = canvasTex(512, 512, (g, w, h) => {
+  g.fillStyle = S.skirt; g.fillRect(0, 0, w, h);
+  const band = (a, b, c) => { g.fillStyle = c; g.fillRect(0, h * a, w, h * (b - a)); };
+  band(0, 0.035, S.hem);
+  band(0.70, 0.93, S.red);
+  band(0.74, 0.755, S.gold); band(0.775, 0.785, S.gold);
+  band(0.875, 0.89, S.gold); band(0.905, 0.915, S.gold);
+  band(0.93, 1, S.hem);
+  const strip = (cx) => {
+    g.fillStyle = '#6e1d1a'; g.fillRect(cx - 20, 0, 40, h * 0.93);
+    g.fillStyle = S.gold; g.fillRect(cx - 18, 0, 3, h * 0.93); g.fillRect(cx + 15, 0, 3, h * 0.93);
+    for (let y = 14, i = 0; y < h * 0.93; y += 20, i++) {
+      g.beginPath(); g.moveTo(cx, y - 7); g.lineTo(cx + 8, y); g.lineTo(cx, y + 7); g.lineTo(cx - 8, y); g.closePath();
+      g.fillStyle = i % 2 ? S.gold : '#c8481f'; g.fill();
+    }
+  };
+  strip(0); strip(w);
+});
+
+// Shawl tail: rust base, gold edge stripes, lattice block on the lower half, bands above the fringe
+const shawlTex = canvasTex(256, 512, (g, w, h) => {
+  g.fillStyle = S.shawl; g.fillRect(0, 0, w, h);
+  g.fillStyle = S.border; g.fillRect(0, 0, 12, h); g.fillRect(w - 12, 0, 12, h);
+  g.fillStyle = S.gold; for (const x of [18, 26, w - 30, w - 22]) g.fillRect(x, 0, 4, h);
+  g.fillStyle = 'rgba(143,42,20,0.25)'; for (let x = 40; x < w - 40; x += 16) g.fillRect(x, 0, 2, h);
+  g.save(); g.beginPath(); g.rect(34, 250, w - 68, 180); g.clip();
+  g.fillStyle = '#b13d1a'; g.fillRect(0, 250, w, 180);
+  g.strokeStyle = S.border; g.lineWidth = 3;
+  for (let k = -300; k < 400; k += 22) {
+    g.beginPath(); g.moveTo(k, 250); g.lineTo(k + 180, 430); g.stroke();
+    g.beginPath(); g.moveTo(k + 180, 250); g.lineTo(k, 430); g.stroke();
+  }
+  g.restore();
+  const bnd = (y, hh, c) => { g.fillStyle = c; g.fillRect(12, y, w - 24, hh); };
+  bnd(196, 10, S.gold); bnd(210, 4, S.gold);
+  bnd(438, 12, S.gold); bnd(456, 14, S.border); bnd(476, 10, S.gold); bnd(492, 12, S.border);
+});
+
+// Chest sash: stripes run along the band
+const sashTex = canvasTex(16, 128, (g, w, h) => {
+  g.fillStyle = S.shawl; g.fillRect(0, 0, w, h);
+  g.fillStyle = S.border; g.fillRect(0, 0, w, 16); g.fillRect(0, h - 16, w, 16);
+  g.fillStyle = S.gold;
+  g.fillRect(0, 26, w, 5); g.fillRect(0, 36, w, 3); g.fillRect(0, h - 31, w, 5); g.fillRect(0, h - 39, w, 3);
+});
+
+// Floral lace for the black sleeves — small 4-petal flowers on a dark ground
+const laceTex = canvasTex(128, 128, (g, w, h) => {
+  g.fillStyle = S.blouse; g.fillRect(0, 0, w, h);
+  const step = 20;
+  for (let row = 0, y0 = 10; y0 < h + step; y0 += step, row++) {
+    const x0start = row % 2 === 0 ? 10 : 20;
+    for (let x0 = x0start; x0 < w + step; x0 += step) {
+      // 4 petals
+      g.fillStyle = '#2b2528';
+      for (const [dx, dy] of [[0,-5],[0,5],[-5,0],[5,0]]) {
+        g.beginPath(); g.ellipse(x0 + dx, y0 + dy, 3, 5, dx === 0 ? 0 : Math.PI/2, 0, Math.PI*2); g.fill();
+      }
+      // center dot
+      g.fillStyle = '#3a3034';
+      g.beginPath(); g.arc(x0, y0, 2, 0, Math.PI * 2); g.fill();
+    }
+  }
+}, 5);
+
+// ---------- poses (data-driven) ----------
+// bodyY: how far the torso drops   lean: forward tilt   sk: skirt scale
+// eye: eye openness   shawl: tail length scale   lUx/lUz/lF: left arm (shoulder fwd/out, elbow)
+const POSES = {
+  idle:  { bodyY: 0,     lean: 0,    sk: [1, 1, 1],         eye: 1,   shawl: 1,
+           lUx: 0,     lUz: 0.10, lF: -0.20,  rUx: 0,     rUz: 0.10, rF: -0.20 },
+  kneel: { bodyY: -0.45, lean: 0.25, sk: [1.6, 0.52, 1.6],   eye: 1,   shawl: 0.55,
+           lUx: -0.25, lUz: 0.05, lF: -0.70,  rUx: -0.90, rUz: 0.05, rF: -0.45 },
+  sit:   { bodyY: -0.62, lean: 0.05, sk: [2.3, 0.35, 2.3],   eye: 0.1, shawl: 0.40,
+           lUx: -0.55, lUz: 0.12, lF: -0.80,  rUx: -0.55, rUz: 0.12, rF: -0.80 },
+};
+
+// ---------- shared secondary motion (hair, shawl, fringe, earrings, coins) ----------
+// Convention: segments hang down (-y). rotation.x > 0 swings the tip backwards (-z),
+// rotation.z > 0 swings the tip toward +x.
+const WIND_GAIN = 0.35;
+const _ct = [0, 0];   // scratch result — chainTarget runs ~50x per frame; allocating here causes GC hitches on phones
+function chainTarget(i, n, ctx, c, phase) {
+  const reach = (i + 1) / n;                 // 0 at the root -> 1 at the tip
+  const w = ctx.wind, t = ctx.t;
+  const tx = clamp(c.kMove * ctx.v.z * reach - w.strength * c.weight * WIND_GAIN * w.lz * reach, -c.max, c.max)
+           + Math.sin(t * 1.3 + i * 0.6 + phase) * c.idle * reach;
+  const tz = clamp(-c.kMove * ctx.v.x * reach + c.kSpin * ctx.omega * reach + w.strength * c.weight * WIND_GAIN * w.lx * reach, -c.max, c.max)
+           + Math.cos(t * 1.1 + i * 0.6 + phase) * c.idle * 0.8 * reach;
+  _ct[0] = tx; _ct[1] = tz;
+  return _ct;           // read both values immediately; the next call overwrites them
+}
+const HAIR   = { kMove: 0.07, kSpin: 0.06, weight: 0.6, max: 0.5, idle: 0.035, lambda: 7 };
+const SHAWL  = { kMove: 0.08, kSpin: 0.05, weight: 1.0, max: 0.5, idle: 0.05,  lambda: 6 };
+const FRINGE = { kMove: 0.12, kSpin: 0.05, weight: 1.4, max: 0.5, idle: 0.10,  lambda: 7 };
+const EAR    = { kMove: 0.10, kSpin: 0.04, weight: 0.3, max: 0.5, idle: 0.05,  lambda: 9 };
+const COIN   = { kMove: 0.05, kSpin: 0.0,  weight: 0.1, max: 0.3, idle: 0.02,  lambda: 8 };
+
+class Chain {
+  constructor(segs, rest, cfg, phase = 0) {
+    this.segs = segs; this.rest = rest; this.cfg = cfg; this.phase = phase;
+    this.ax = new Float32Array(segs.length); this.az = new Float32Array(segs.length);
+  }
+  update(ctx, dt) {
+    const n = this.segs.length, c = this.cfg;
+    for (let i = 0; i < n; i++) {
+      const r = chainTarget(i, n, ctx, c, this.phase), tx = r[0], tz = r[1];
+      // per-segment lag: the tip lags more than the root -> follow-through
+      const k = 1 - Math.exp(-c.lambda * (1 - 0.45 * (i + 1) / n) * dt);
+      this.ax[i] += (tx - this.ax[i]) * k;
+      this.az[i] += (tz - this.az[i]) * k;
+      this.segs[i].rotation.x = (this.rest[i] || 0) + this.ax[i];
+      this.segs[i].rotation.z = this.az[i];
+    }
+  }
+}
+
+// n nested tapered segments hanging from `anchor` (in parent space)
+function buildChain(parent, anchor, n, segLen, wTop, wTip, depth, mat) {
+  const segs = []; let p = parent;
+  for (let i = 0; i < n; i++) {
+    const g = new THREE.Group();
+    if (i === 0) g.position.set(anchor[0], anchor[1], anchor[2]); else g.position.y = -segLen;
+    p.add(g);
+    const wa = lerp(wTop, wTip, i / n), wb = lerp(wTop, wTip, (i + 1) / n);
+    const geo = new THREE.CylinderGeometry(wa / 2, wb / 2, segLen * 1.08, 8, 1);
+    geo.translate(0, -segLen / 2, 0);
+    const m = new THREE.Mesh(geo, mat); m.scale.z = depth; g.add(m);
+    segs.push(g); p = g;
+  }
+  return segs;
+}
+
+// ---------- ONE continuous saree ribbon: hip tuck → chest → shoulder → pallu top ----------
+// Sweeps a variable-width rectangle along a CatmullRomCurve3 in torso space.
+// Returns { mesh, endPoint, endWidthDir } so the shawl chain can attach seamlessly.
+function makeSareeDrape() {
+  // Control points: [x her-left, y up, z front] in torso-local space
+  const ctrlPts = [
+    [-0.14, 0.05,  0.115],  // tuck at right hip
+    [-0.09, 0.15,  0.150],
+    [-0.01, 0.26,  0.150],
+    [ 0.08, 0.37,  0.140],
+    [ 0.14, 0.47,  0.085],  // in front of left shoulder
+    [ 0.17, 0.495, 0.000],  // over the top of the shoulder
+    [ 0.13, 0.45,  -0.095],  // closer to back surface (~1 cm lift)
+    [ 0.09, 0.34,  -0.135],  // straight down the back — ribbon ends pointing downward
+  ].map(p => new THREE.Vector3(...p));
+  const curve = new THREE.CatmullRomCurve3(ctrlPts, false, 'catmullrom', 0.5);
+
+  // Width profile: hip→0.15, chest→0.20, shoulder→0.22, end→0.30
+  const widthAt = t => {
+    if (t < 0.5) return THREE.MathUtils.lerp(0.15, 0.22, t / 0.5);
+    return THREE.MathUtils.lerp(0.22, 0.30, (t - 0.5) / 0.5);
+  };
+
+  // Torso ellipsoid outward normal at a point (gives width-direction that hugs the surface)
+  const TX = 0.16, TY = 0.28, TYC = 0.25, TZ = 0.126;
+  const torsoNormal = p => new THREE.Vector3(
+    p.x / (TX * TX), (p.y - TYC) / (TY * TY), p.z / (TZ * TZ)
+  ).normalize();
+
+  const SAMPLES = 80;
+  const pos = [], uv = [], idx = [];
+  let arcLen = 0, prevPt = null;
+  const pts = [], wds = [], uvUs = [];
+
+  for (let i = 0; i <= SAMPLES; i++) {
+    const t = i / SAMPLES;
+    const pt = curve.getPoint(t);
+    const tan = curve.getTangent(t).normalize();
+    // width direction = tangent × torsoNormal, normalized
+    const tn = torsoNormal(pt);
+    const wDir = new THREE.Vector3().crossVectors(tan, tn).normalize();
+    // if degenerate (parallel), fall back to world-up cross tangent
+    if (wDir.lengthSq() < 0.01) wDir.crossVectors(tan, new THREE.Vector3(0,1,0)).normalize();
+    const hw = widthAt(t) * 0.5;
+    // pleat ripple along tn
+    const pleat = Math.sin(t * Math.PI * 2 * 6) * 0.006;
+    const lift = 0.015 + pleat;       // keep ~1.5 cm above body
+    const centre = pt.clone().addScaledVector(tn, lift);
+    if (prevPt) arcLen += centre.distanceTo(prevPt);
+    prevPt = centre.clone();
+    pts.push(centre); wds.push({ wDir, hw });
+    uvUs.push(arcLen);   // collect arc length; normalise after
+  }
+  const totalLen = arcLen || 1;
+
+  for (let i = 0; i <= SAMPLES; i++) {
+    const { wDir, hw } = wds[i];
+    const c = pts[i];
+    const a = c.clone().addScaledVector(wDir, -hw);
+    const b = c.clone().addScaledVector(wDir,  hw);
+    const u = uvUs[i] / totalLen;
+    pos.push(a.x, a.y, a.z, b.x, b.y, b.z);
+    uv.push(u, 0,  u, 1);
+    if (i < SAMPLES) {
+      const k = i * 2;
+      idx.push(k, k+1, k+2,  k+1, k+3, k+2);
+    }
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  geo.setAttribute('uv',       new THREE.Float32BufferAttribute(uv,  2));
+  geo.setIndex(idx);
+  geo.computeVertexNormals();
+  const mesh = new THREE.Mesh(geo, toon(0xffffff, { map: sashTex, side: THREE.DoubleSide }));
+
+  // Return the end cross-section data so the shawl chain can attach with no gap
+  const endPt  = pts[SAMPLES].clone();
+  const endWDir = wds[SAMPLES].wDir.clone();
+  return { mesh, endPt, endWDir };
+}
+
+// ---------- the character ----------
+const SKIRT_H = 0.9;
+const MOVE_SPEED = 2.0;
+// skull ellipsoid (head-local) — also used to stick face features onto the surface
+const SK = { rx: 0.1175, ry: 0.13, rz: 0.125, cy: 0.115 };
+const onSkull = (x, y) => {
+  const a = 1 - (x / SK.rx) ** 2 - ((y - SK.cy) / SK.ry) ** 2;
+  return a > 0 ? SK.rz * Math.sqrt(a) : 0;
+};
+function placeOnSkull(o, x, y, lift = 0.001) {
+  const z = onSkull(x, y);
+  const nx = x / SK.rx ** 2, ny = (y - SK.cy) / SK.ry ** 2, nz = z / SK.rz ** 2;
+  const len = Math.hypot(nx, ny, nz) || 1;
+  o.position.set(x + (nx / len) * lift, y + (ny / len) * lift, z + (nz / len) * lift);
+  o.rotation.order = 'YXZ';
+  o.rotation.y = Math.atan2(nx, nz);
+  o.rotation.x = -Math.atan2(ny, Math.hypot(nx, nz));
+}
+
+function buildCharacter() {
+  const root = new THREE.Group(); root.name = 'characterRoot';
+
+  const mSkin = toon(S.skin);
+  const mBlouse = toon(S.blouse);
+  const mSleeve = toon(0xffffff, { map: laceTex });
+  const mHair = toon(S.hair, { side: THREE.DoubleSide });
+  const mSilver = toon(S.silver, { emissive: 0x23272b });
+  const mShawl = toon(0xffffff, { map: shawlTex, side: THREE.DoubleSide });
+  const dark = new THREE.MeshBasicMaterial({ color: '#1a1210' });
+
+  // ---- lower body: skirt (pivots at the waist so the hem swings) + peeking feet ----
+  const skirtGroup = new THREE.Group(); root.add(skirtGroup);
+  const skirtGeo = new THREE.CylinderGeometry(0.17, 0.23, SKIRT_H, 40, 1, false);
+  // Add subtle vertical fold lines: nudge each ring's vertex radii with a small sine
+  // so the toon gradient picks up soft shadow bands around the circumference.
+  {
+    const pos = skirtGeo.attributes.position;
+    const FOLDS = 7;           // number of fold peaks around the circumference
+    const FOLD_AMP = 0.008;    // ±8 mm — barely visible but enough for toon bands
+    for (let i = 0; i < pos.count; i++) {
+      const x = pos.getX(i), z = pos.getZ(i);
+      const angle = Math.atan2(z, x);
+      const r = Math.hypot(x, z);
+      if (r < 0.001) continue;   // skip cap centres (open=false has none, but guard anyway)
+      const nudge = 1 + (FOLD_AMP / r) * Math.sin(FOLDS * angle);
+      pos.setXYZ(i, x * nudge, pos.getY(i), z * nudge);
+    }
+    pos.needsUpdate = true;
+    skirtGeo.computeVertexNormals();
+  }
+  skirtGeo.translate(0, SKIRT_H / 2, 0);                  // origin at the hem, so scaling keeps it on the floor
+  const skirt = mk(skirtGeo, toon(0xffffff, { map: skirtTex }), 0.012);
+  skirtGroup.add(skirt);
+
+  const footGeo = new THREE.SphereGeometry(1, 12, 8);
+  const footL = new THREE.Mesh(footGeo, mSkin), footR = new THREE.Mesh(footGeo, mSkin);
+  for (const f of [footL, footR]) { f.scale.set(0.04, 0.025, 0.07); root.add(f); }
+
+  // ---- body (bobs / leans) -> torso ----
+  const body = new THREE.Group(); root.add(body);
+  const torso = new THREE.Group(); body.add(torso);
+
+  const blouse = mk(new THREE.CapsuleGeometry(0.14, 0.16, 6, 20), mBlouse, OL(0.010));
+  blouse.scale.set(1.08, 1, 0.9); blouse.position.y = 0.30; torso.add(blouse);
+  // bare midriff: skin-coloured cylinder fills the gap between blouse bottom and skirt waist
+  const waist = mk(new THREE.CylinderGeometry(0.115, 0.125, 0.12, 16), mSkin, 0.006);
+  waist.position.y = 0.04; torso.add(waist);
+  // ONE continuous saree ribbon (hip → chest → shoulder → pallu top)
+  const { mesh: sareeMesh, endPt: sarEndPt, endWDir: sarEndW } = makeSareeDrape();
+  torso.add(sareeMesh);
+
+  // arms: shoulder -> elbow -> wrist, nested so a parent rotation carries the child.
+  // Tapered cylinders with cap spheres hide the pinched joint artefact of stacked capsules.
+  function makeArm(side) {
+    const shoulder = new THREE.Group(); shoulder.position.set(0.17 * side, 0.42, 0); torso.add(shoulder);
+    // shoulder cap — hides the seam where the arm meets the torso
+    const sCap = new THREE.Mesh(new THREE.SphereGeometry(0.048, 14, 10), mSleeve);
+    shoulder.add(sCap);
+    // upper arm: tapered cylinder, top radius 0.048, bottom 0.040, length 0.28
+    const upper = mk(new THREE.CylinderGeometry(0.048, 0.040, 0.28, 14), mSleeve, OL(0.008));
+    upper.position.y = -0.14; shoulder.add(upper);
+    // elbow group
+    const elbow = new THREE.Group(); elbow.position.y = -0.28; shoulder.add(elbow);
+    // elbow cap sphere — hides the pinched joint
+    const eCap = new THREE.Mesh(new THREE.SphereGeometry(0.040, 12, 8), mSleeve);
+    elbow.add(eCap);
+    // forearm: tapered cylinder, top 0.040, bottom 0.030, length 0.26
+    const fore = mk(new THREE.CylinderGeometry(0.040, 0.030, 0.26, 14), mSleeve, OL(0.008));
+    fore.position.y = -0.13; elbow.add(fore);
+    // wrist group
+    const wrist = new THREE.Group(); wrist.position.y = -0.26; elbow.add(wrist);
+    // flat palm
+    const hand = mk(new THREE.SphereGeometry(0.045, 14, 10), mSkin, 0.007);
+    hand.scale.set(0.75, 1.3, 0.45); hand.position.y = -0.038; wrist.add(hand);
+    // thumb sphere on the inner (torso) side
+    const thumb = new THREE.Mesh(new THREE.SphereGeometry(0.016, 8, 6), mSkin);
+    thumb.position.set(0.018 * side, -0.025, 0.018); wrist.add(thumb);
+    return { shoulder, elbow };
+  }
+  const armL = makeArm(+1);   // her left = +x (she faces +z)
+  const armR = makeArm(-1);
+
+  // neck + head
+  const neck = mk(new THREE.CylinderGeometry(0.045, 0.05, 0.1, 12), mSkin, 0.006);
+  neck.position.y = 0.53; torso.add(neck);
+  const head = new THREE.Group(); head.position.y = 0.56; head.scale.setScalar(1.2); torso.add(head);
+  const skull = mk(new THREE.SphereGeometry(1, 28, 20), mSkin, 0.008);
+  skull.scale.set(SK.rx, SK.ry, SK.rz); skull.position.y = SK.cy; head.add(skull);
+
+  // ---- face ----
+  const eyes = [];
+  for (const side of [-1, 1]) {
+    const g = new THREE.Group(); head.add(g);
+    placeOnSkull(g, 0.047 * side, 0.108, 0.001);
+    const ball = new THREE.Mesh(new THREE.SphereGeometry(1, 12, 10), dark);
+    ball.scale.set(0.0175, 0.022, 0.006); g.add(ball);
+    const hl = new THREE.Mesh(new THREE.SphereGeometry(1, 8, 6), new THREE.MeshBasicMaterial({ color: '#ffffff' }));
+    hl.scale.setScalar(0.0045); hl.position.set(0.005, 0.008, 0.005); g.add(hl);
+    eyes.push(g);
+
+    const brow = new THREE.Group(); head.add(brow);
+    placeOnSkull(brow, 0.05 * side, 0.152, 0.002);
+    const arc = new THREE.Mesh(new THREE.TorusGeometry(0.03, 0.0035, 6, 14, Math.PI * 0.6), dark);
+    arc.rotation.z = Math.PI * 0.2 - side * 0.12; brow.add(arc);
+
+    const cheek = new THREE.Mesh(new THREE.CircleGeometry(0.03, 20),
+      new THREE.MeshBasicMaterial({ color: S.blush, transparent: true, opacity: 0.35, depthWrite: false,
+                                    polygonOffset: true, polygonOffsetFactor: -1 }));
+    head.add(cheek); placeOnSkull(cheek, 0.072 * side, 0.082, 0.0015);
+  }
+  const mouth = new THREE.Group(); head.add(mouth); placeOnSkull(mouth, 0, 0.045, 0.002);
+  const smile = new THREE.Mesh(new THREE.TorusGeometry(0.024, 0.0035, 6, 20, Math.PI * 0.8),
+                               new THREE.MeshBasicMaterial({ color: '#7a2b2b' }));
+  smile.rotation.z = Math.PI * 1.1; mouth.add(smile);
+  const nose = new THREE.Mesh(new THREE.SphereGeometry(0.011, 10, 8), mSkin);
+  nose.scale.set(1, 0.9, 0.8); head.add(nose); placeOnSkull(nose, 0, 0.083, 0.006);
+
+  // ---- hair ----
+  // cap = two partial spheres (top ring + back/sides) so the forehead and face stay open
+  const cap = (phiStart, phiLen, thStart, thLen) => {
+    const m = new THREE.Mesh(new THREE.SphereGeometry(1, 28, 14, phiStart, phiLen, thStart, thLen), mHair);
+    m.scale.set(SK.rx * 1.07, SK.ry * 1.08, SK.rz * 1.07); m.position.set(0, SK.cy + 0.002, -0.004);
+    head.add(m);
+  };
+  cap(0, Math.PI * 2, 0, Math.PI * 0.36);
+  cap(Math.PI / 2 + 0.9, Math.PI * 2 - 1.8, Math.PI * 0.36, Math.PI * 0.34);
+
+  const chains = [];     // everything driven by the shared secondary-motion function
+  // Back hair: deeper anchor and steeper initial rest angle so the chains flow
+  // outside the saree cloth (~2 cm behind the back surface) and never pass under it.
+  const backRest = [0.35, -0.20, -0.08, -0.04, 0, 0];
+  for (const [x, len] of [[-0.06, 0.105], [0, 0.12], [0.06, 0.105]]) {
+    const segs = buildChain(head, [x, 0.05, -0.125], 6, len, 0.075, 0.016, 0.45, mHair);
+    chains.push(new Chain(segs, backRest, HAIR, x * 20));
+  }
+  for (const side of [-1, 1]) {   // front locks framing the face, over the collarbones
+    const segs = buildChain(head, [0.105 * side, 0.13, 0.06], 3, 0.08, 0.05, 0.02, 0.5, mHair);
+    chains.push(new Chain(segs, [-0.1, 0, 0], HAIR, side * 2));
+  }
+
+  // ---- earrings: dangling silver drops ----
+  for (const side of [-1, 1]) {
+    const segs = buildChain(head, [0.112 * side, 0.045, 0], 2, 0.05, 0.012, 0.034, 0.5, mSilver);
+    chains.push(new Chain(segs, [], EAR, side));
+  }
+
+  // ---- shawl tail: 7 nested pleated segments — root anchored to ribbon end ----
+  // sarEndPt is the last centre of the ribbon cross-section (in torso space).
+  // sarEndW is the width-direction of that cross-section; we rotate the root so the
+  // chain's local +x aligns with sarEndW, giving a seamless join.
+  const shawlRoot = new THREE.Group();
+  shawlRoot.position.copy(sarEndPt);
+  // Rotate ONLY around y so the tail's local +x aligns with the ribbon end-width direction,
+  // and local -y (chain hang direction) stays exactly world -y. No tilt (rx = rz = 0).
+  // The tail plane's width runs along its local +x axis. Rotating about y by theta maps
+  // local +x to (cos(theta), 0, -sin(theta)). To match the ribbon end width direction
+  // (wx, 0, wz) we need theta = atan2(-wz, wx).
+  if (sarEndW.x < 0) sarEndW.negate();   // keep a consistent sign so the plane never flips 180 degrees
+  shawlRoot.rotation.y = Math.atan2(-sarEndW.z, sarEndW.x);
+  torso.add(shawlRoot);
+  const N = 7, SW = 0.30, SH = 0.15;
+  const shawlSegs = []; let sp = shawlRoot;
+  for (let i = 0; i < N; i++) {
+    const g = new THREE.Group(); if (i) g.position.y = -SH; sp.add(g);
+    // subdivided plane so per-vertex z displacement gives visible pleats
+    const geo = new THREE.PlaneGeometry(SW, SH * 1.06, 10, 1);
+    const uvAttr = geo.attributes.uv;
+    for (let j = 0; j < uvAttr.count; j++) uvAttr.setY(j, 1 - (i + (1 - uvAttr.getY(j))) / N);
+    // vertical pleat: displace each vertex in z proportional to sin of its x position
+    const posAttr = geo.attributes.position;
+    for (let j = 0; j < posAttr.count; j++) {
+      const x = posAttr.getX(j);
+      posAttr.setZ(j, posAttr.getZ(j) + Math.sin(x / SW * Math.PI * 2 * 3) * 0.012);
+    }
+    posAttr.needsUpdate = true;
+    geo.computeVertexNormals();
+    geo.translate(0, -SH / 2, 0);
+    g.add(new THREE.Mesh(geo, mShawl));
+    shawlSegs.push(g); sp = g;
+  }
+  chains.push(new Chain(shawlSegs, [0.02, 0, 0, 0, 0, 0, 0], SHAWL, 0));
+
+  // fringe: one InstancedMesh hanging off the last segment
+  const FR = 14;
+  const fringeGeo = new THREE.CylinderGeometry(0.0075, 0.0025, 0.10, 5, 1); fringeGeo.translate(0, -0.05, 0);
+  const fringe = new THREE.InstancedMesh(fringeGeo, toon(S.shawl), FR);
+  fringe.frustumCulled = false; fringe.position.y = -SH; shawlSegs[N - 1].add(fringe);
+  const fringeAx = new Float32Array(FR), fringeAz = new Float32Array(FR);
+  const dummy = new THREE.Object3D();
+  function updateFringe(ctx, dt) {
+    for (let k = 0; k < FR; k++) {
+      const r = chainTarget(0, 1, ctx, FRINGE, k * 0.9), tx = r[0], tz = r[1];
+      const a = 1 - Math.exp(-FRINGE.lambda * dt);
+      fringeAx[k] += (tx - fringeAx[k]) * a; fringeAz[k] += (tz - fringeAz[k]) * a;
+      dummy.position.set((k / (FR - 1) - 0.5) * (SW - 0.02), 0, 0);
+      dummy.rotation.set(fringeAx[k], 0, fringeAz[k]);
+      dummy.updateMatrix(); fringe.setMatrixAt(k, dummy.matrix);
+    }
+    fringe.instanceMatrix.needsUpdate = true;
+  }
+  updateFringe({ t: 0, v: { x: 0, z: 0 }, omega: 0, wind: { lx: 0, lz: 0, strength: 0 } }, 0);
+
+  // ---- necklace: string + 11 instanced coins along a U-shaped curve ----
+  const curve = new THREE.CatmullRomCurve3([
+    [-0.075, 0.50, 0.105], [-0.115, 0.40, 0.16], [-0.12, 0.28, 0.175], [-0.075, 0.17, 0.185], [0, 0.11, 0.19],
+    [0.075, 0.17, 0.185], [0.12, 0.28, 0.175], [0.115, 0.40, 0.16], [0.075, 0.50, 0.105],
+  ].map(p => new THREE.Vector3(...p)));
+  torso.add(new THREE.Mesh(new THREE.TubeGeometry(curve, 64, 0.0035, 5, false), mSilver));
+  const COINS = 11;
+  const coinGeo = new THREE.CylinderGeometry(0.02, 0.02, 0.006, 20); coinGeo.rotateX(Math.PI / 2);   // face axis = +z
+  const coins = new THREE.InstancedMesh(coinGeo, mSilver, COINS); torso.add(coins);
+  const coinP = [], coinQ = [], coinS = [];
+  const zAxis = new THREE.Vector3(0, 0, 1);
+  for (let k = 0; k < COINS; k++) {
+    const u = 0.5 + (k - 5) * 0.07;
+    const p = curve.getPointAt(u), tan = curve.getTangentAt(u);
+    const out = zAxis.clone(); out.addScaledVector(tan, -out.dot(tan)).normalize();   // face outward, along the curve normal
+    const r = 0.0155 + 0.0125 * Math.pow(1 - Math.abs(k - 5) / 5, 1.6);               // biggest at the bottom
+    coinP.push(p); coinQ.push(new THREE.Quaternion().setFromUnitVectors(zAxis, out)); coinS.push(new THREE.Vector3(r / 0.02, r / 0.02, 1));
+    coins.setMatrixAt(k, new THREE.Matrix4().compose(p, coinQ[k], coinS[k]));
+  }
+  const coinAx = { x: 0, z: 0 }, qTmp = new THREE.Quaternion(), qOut = new THREE.Quaternion(), eTmp = new THREE.Euler(), mTmp = new THREE.Matrix4();
+  function updateCoins(ctx, dt) {
+    const r = chainTarget(0, 1, ctx, COIN, 0), tx = r[0], tz = r[1], a = 1 - Math.exp(-COIN.lambda * dt);
+    coinAx.x += (tx - coinAx.x) * a; coinAx.z += (tz - coinAx.z) * a;
+    for (let k = 4; k <= 6; k++) {          // only the bottom 3 coins swing
+      qTmp.setFromEuler(eTmp.set(coinAx.x * 4, 0, coinAx.z * 4));
+      mTmp.compose(coinP[k], qOut.copy(coinQ[k]).multiply(qTmp), coinS[k]);
+      coins.setMatrixAt(k, mTmp);
+    }
+    coins.instanceMatrix.needsUpdate = true;
+  }
+
+  // ---- state + per-frame update ----
+  const P = { ...POSES.idle, sk: [...POSES.idle.sk] };
+  const state = { vx: 0, vz: 0, yaw: 0, omega: 0, phase: 0, walk: 0 };
+
+  // dir = world-space walk direction ({x,z}, unit length or zero), poseName = 'idle' | 'kneel' | 'sit'
+  function update(dt, t, dir, poseName = 'idle') {
+    dt = Math.min(dt, 0.05);                       // a tab switch must not snap the chains
+    const d = poseName === 'idle' ? dir : { x: 0, z: 0 };
+
+    // movement: smoothed velocity so cloth sees smooth accelerations
+    const k = 1 - Math.exp(-10 * dt);
+    state.vx += (d.x * MOVE_SPEED - state.vx) * k;
+    state.vz += (d.z * MOVE_SPEED - state.vz) * k;
+    const speed = Math.hypot(state.vx, state.vz);
+    root.position.x += state.vx * dt; root.position.z += state.vz * dt;
+
+    const prevYaw = state.yaw;
+    if (d.x !== 0 || d.z !== 0) state.yaw = dampAngle(state.yaw, Math.atan2(d.x, d.z), 12, dt);
+    const rawOmega = dt > 0 ? Math.atan2(Math.sin(state.yaw - prevYaw), Math.cos(state.yaw - prevYaw)) / dt : 0;
+    state.omega += (clamp(rawOmega, -6, 6) - state.omega) * (1 - Math.exp(-12 * dt));
+    root.rotation.y = state.yaw;
+
+    // velocity + wind in the character's local frame
+    const sy = Math.sin(state.yaw), cy = Math.cos(state.yaw);
+    const w = getWind(t);
+    const ctx = {
+      t, omega: state.omega,
+      v: { x: state.vx * cy - state.vz * sy, z: state.vx * sy + state.vz * cy },
+      wind: { lx: w.x * cy - w.z * sy, lz: w.x * sy + w.z * cy, strength: w.strength },
+    };
+
+    // pose blend: value += (target - value) * (1 - e^(-k dt))
+    const T = POSES[poseName], pk = 1 - Math.exp(-9 * dt);
+    for (const key of Object.keys(T)) {
+      if (key === 'sk') for (let i = 0; i < 3; i++) P.sk[i] += (T.sk[i] - P.sk[i]) * pk;
+      else P[key] += (T[key] - P[key]) * pk;
+    }
+
+    // walk cycle: stride phase advances with speed, so everything freezes at rest
+    state.walk = clamp(speed / MOVE_SPEED, 0, 1);
+    state.phase += speed * 3.0 * dt;
+    const ph = state.phase, wk = state.walk;
+
+    body.position.y = SKIRT_H + P.bodyY + Math.sin(ph * 2) * 0.012 * wk;   // bob at 2x step frequency
+    body.rotation.x = P.lean + 0.05 * wk;
+    head.rotation.x = -P.lean * 0.6;
+
+    skirtGroup.position.y = SKIRT_H * P.sk[1];             // pivot at the waist
+    skirt.position.y = -SKIRT_H * P.sk[1];
+    skirt.scale.set(P.sk[0], P.sk[1], P.sk[2]);
+    skirtGroup.rotation.z = Math.sin(ph) * 0.05 * wk;      // hem sway
+    skirtGroup.rotation.x = clamp(-ctx.v.z * 0.02, -0.06, 0.06);
+
+    const swing = Math.sin(ph) * 0.30 * wk;                // arms swing in opposition (reduced to avoid tail overlap)
+    armL.shoulder.rotation.set(P.lUx + swing, 0, P.lUz);
+    armR.shoulder.rotation.set(P.rUx - swing, 0, -P.rUz);
+    armL.elbow.rotation.x = P.lF - 0.25 * wk;
+    armR.elbow.rotation.x = P.rF - 0.25 * wk;
+
+    const sL = Math.sin(ph), sR = -sL;                     // feet alternately peek out under the hem
+    footL.position.set(0.065, 0.025 + 0.04 * Math.max(0, sL) * wk, 0.18 + 0.10 * Math.max(0, sL) * wk);
+    footR.position.set(-0.065, 0.025 + 0.04 * Math.max(0, sR) * wk, 0.18 + 0.10 * Math.max(0, sR) * wk);
+
+    const blink = (t % 4.2) < 0.12 ? 0.1 : 1;              // eyes close when she sits, blink when not
+    for (const e of eyes) e.scale.y = Math.max(0.08, P.eye * blink);
+
+    shawlRoot.scale.y = P.shawl;                           // tail shortens as she kneels / sits
+
+    for (const c of chains) c.update(ctx, dt);
+    updateFringe(ctx, dt);
+    updateCoins(ctx, dt);
+  }
+
+  return { root, update, state, P };
+}
+
+// =====================================================================
+// ==== LIB END
+// =====================================================================
+
+// =====================================================================
+// ==== ENV START — vihara courtyard at golden hour. The character never reads this block.
+// =====================================================================
+// Courtyard is 14 x 14 m, centred on the origin. +z is the way she faces (prayer hall goes there later).
+const WORLD = { half: 7, margin: 0.6 };
+
+function buildEnvironment(scene) {
+  const HORIZON = '#f2cfa0';
+
+  // ---- sky dome: vertical gradient, follows the camera so it never shows an edge ----
+  // A sphere's v runs 0 (bottom pole) -> 1 (top pole), so the horizon sits at canvas y = 0.5 and
+  // each degree of elevation is 1/180 of the canvas. The camera only sees about 0-40 degrees up,
+  // so the whole warm-to-cool change is packed into canvas y 0.28 - 0.5 where it is actually visible.
+  const skyTex = canvasTex(8, 256, (g, w, h) => {
+    const gr = g.createLinearGradient(0, 0, 0, h);
+    [[0, '#26305a'], [0.15, '#3b4a7a'], [0.28, '#5f6c9e'], [0.34, '#9a7fa8'], [0.40, '#e09a6e'], [0.45, '#f5c08a'], [0.5, HORIZON], [1, HORIZON]]
+      .forEach(([s, c]) => gr.addColorStop(s, c));
+    g.fillStyle = gr; g.fillRect(0, 0, w, h);
+  });
+  const sky = new THREE.Mesh(
+    new THREE.SphereGeometry(90, 24, 16),
+    new THREE.MeshBasicMaterial({ map: skyTex, side: THREE.BackSide, fog: false, depthWrite: false }));
+  sky.renderOrder = -1;
+  scene.add(sky);
+  scene.background = new THREE.Color(HORIZON);
+  scene.fog = new THREE.Fog(HORIZON, 14, 48);
+
+  // ---- lighting (no shadow maps: phones can't afford them) ----
+  scene.add(new THREE.HemisphereLight(0xffe2b8, 0x5a4a3a, 1.2));
+  const sun = new THREE.DirectionalLight(0xffc98a, 2.0);
+  sun.position.set(4, 5, -6);            // behind + right of the camera, so her back is lit
+  scene.add(sun);
+
+  // ---- ground ----
+  const outer = new THREE.Mesh(new THREE.PlaneGeometry(200, 200), toon('#9a8a5a'));
+  outer.rotation.x = -Math.PI / 2;
+  scene.add(outer);
+
+  const hsh = (i, j) => { const s = Math.sin(i * 12.9898 + j * 78.233) * 43758.5453; return s - Math.floor(s); };
+  const pavingTex = canvasTex(512, 512, (g, w, h) => {
+    const slab = 128;
+    for (let j = 0; j < 4; j++) for (let i = 0; i < 4; i++) {
+      const f = 1 + (hsh(i, j) - 0.5) * 0.16;                       // +-8 % brightness per slab
+      g.fillStyle = `rgb(${Math.round(205 * f)},${Math.round(191 * f)},${Math.round(159 * f)})`;
+      g.fillRect(i * slab, j * slab, slab, slab);
+    }
+    g.fillStyle = '#a89a7c';                                          // grout
+    for (let k = 0; k <= 4; k++) {
+      g.fillRect(k * slab - 1.5, 0, 3, h);
+      g.fillRect(0, k * slab - 1.5, w, 3);
+    }
+  }, 3.5);                                                            // 14 m / 3.5 = 4 m per tile = 1 m slabs
+  const paving = new THREE.Mesh(new THREE.PlaneGeometry(14, 14), toon(0xffffff, { map: pavingTex }));
+  paving.rotation.x = -Math.PI / 2;
+  paving.position.y = 0.004;
+  scene.add(paving);
+
+  // ---- perimeter wall: knee-high, whitewashed, 2.4 m gate gap on the -z side ----
+  const mWall = toon('#e8dcc4'), mPost = toon('#6b3f2a');
+  const box = (w, h, d, x, y, z, mat) => {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+    m.position.set(x, y, z);
+    scene.add(m);
+    return m;
+  };
+  const H = WORLD.half, T = 0.3, WH = 0.5, GAP = 1.2;               // GAP = half the gate opening
+  box(2 * H + T, WH, T, 0, WH / 2, +H, mWall);                        // back wall (+z)
+  box(T, WH, 2 * H + T, -H, WH / 2, 0, mWall);                        // left wall
+  box(T, WH, 2 * H + T, +H, WH / 2, 0, mWall);                        // right wall
+  const start = GAP + 0.3, frontLen = H - start;                      // wall starts 0.3 m in, hidden inside the post
+  box(frontLen, WH, T, -(start + frontLen / 2), WH / 2, -H, mWall);   // front wall, left of the gate
+  box(frontLen, WH, T, +(start + frontLen / 2), WH / 2, -H, mWall);   // front wall, right of the gate
+  box(0.35, 1.2, 0.35, -(GAP + 0.175), 0.6, -H, mPost);               // gate posts
+  box(0.35, 1.2, 0.35, +(GAP + 0.175), 0.6, -H, mPost);
+
+  return { sky };
+}
+// =====================================================================
+// ==== ENV END
+// =====================================================================
+
+// ---------- demo scene: courtyard, follow camera, keyboard ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+// Phones: fill-rate (pixels x overdraw) is the real cost, not triangles. Start lower; the monitor in the loop steps down further if needed.
+const DPR_MAX = MOBILE ? 1.5 : 2;
+let dpr = Math.min(devicePixelRatio, DPR_MAX);
+renderer.setPixelRatio(dpr);
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const env = buildEnvironment(scene);
+
+const character = buildCharacter(); scene.add(character.root);
+character.root.position.set(0, 0, -4.5);   // start just inside the gate
+window.character = character;   // handy for poking around in the console
+
+const shadow = new THREE.Mesh(new THREE.CircleGeometry(0.5, 32),
+  new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.18, depthWrite: false }));
+shadow.rotation.x = -Math.PI / 2; shadow.position.y = 0.01; scene.add(shadow);
+
+const camera = new THREE.PerspectiveCamera(40, innerWidth / innerHeight, 0.1, 100);
+let camYaw = Math.PI, camPitch = 0.22, camDist = 4.2;       // yaw = PI puts the camera behind her (she faces +z)
+const camTarget = new THREE.Vector3(0, 1.0, -4.5);
+
+addEventListener('resize', () => {
+  renderer.setSize(innerWidth, innerHeight);
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+});
+// ---------- input: mouse and touch share one pointer path ----------
+const canvasEl = renderer.domElement;
+const pts = new Map();                  // active canvas pointers: 1 = orbit, 2 = pinch zoom
+let lastPinch = 0;
+const pinchDist = () => { const [a, b] = [...pts.values()]; return Math.hypot(a.x - b.x, a.y - b.y); };
+canvasEl.addEventListener('pointerdown', (e) => {
+  canvasEl.setPointerCapture(e.pointerId);
+  pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (pts.size === 2) lastPinch = pinchDist();
+});
+canvasEl.addEventListener('pointermove', (e) => {
+  const p = pts.get(e.pointerId); if (!p) return;
+  // deltas from clientX/Y: movementX/Y is not dependable for touch pointers across mobile browsers
+  const dx = e.clientX - p.x, dy = e.clientY - p.y; p.x = e.clientX; p.y = e.clientY;
+  if (pts.size === 1) {
+    camYaw -= dx * 0.005;
+    camPitch = THREE.MathUtils.clamp(camPitch + dy * 0.004, -0.05, 1.25);
+  } else if (pts.size === 2) {
+    const d = pinchDist();
+    if (lastPinch && d) camDist = THREE.MathUtils.clamp(camDist * (lastPinch / d), 1.5, 9);
+    lastPinch = d;
+  }
+});
+const endPointer = (e) => { pts.delete(e.pointerId); lastPinch = 0; };   // pointercancel matters: the browser can steal a touch
+canvasEl.addEventListener('pointerup', endPointer);
+canvasEl.addEventListener('pointercancel', endPointer);
+addEventListener('contextmenu', (e) => { if (matchMedia('(pointer: coarse)').matches) e.preventDefault(); });  // no long-press menu
+
+// ---------- touch joystick (left thumb) ----------
+const joy = { x: 0, y: 0 };             // -1..1 in screen axes (up = negative y)
+const stickEl = document.getElementById('stick'), knobEl = document.getElementById('knob');
+const STICK_R = 48;
+let joyId = null, joyCx = 0, joyCy = 0;
+function moveStick(e) {
+  let dx = e.clientX - joyCx, dy = e.clientY - joyCy;
+  const d = Math.hypot(dx, dy);
+  if (d > STICK_R) { dx *= STICK_R / d; dy *= STICK_R / d; }
+  knobEl.style.transform = `translate(${dx}px, ${dy}px)`;
+  const m = Math.hypot(dx, dy) / STICK_R;
+  joy.x = m < 0.12 ? 0 : dx / STICK_R;  // small dead zone so a resting thumb doesn't drift her
+  joy.y = m < 0.12 ? 0 : dy / STICK_R;
+}
+stickEl.addEventListener('pointerdown', (e) => {
+  joyId = e.pointerId; stickEl.setPointerCapture(joyId);
+  const r = stickEl.getBoundingClientRect(); joyCx = r.left + r.width / 2; joyCy = r.top + r.height / 2;
+  moveStick(e);
+});
+stickEl.addEventListener('pointermove', (e) => { if (e.pointerId === joyId) moveStick(e); });
+const endStick = (e) => {
+  if (e.pointerId !== joyId) return;
+  joyId = null; joy.x = joy.y = 0; knobEl.style.transform = '';
+};
+stickEl.addEventListener('pointerup', endStick);
+stickEl.addEventListener('pointercancel', endStick);
+
+// ---------- action buttons (right thumb): replace keys 1/2/3/G ----------
+for (const b of document.querySelectorAll('#btns button')) {
+  b.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    if (b.dataset.act === 'gust') triggerGust(); else poseName = b.dataset.act;
+  });
+}
+
+// ---------- frame-time monitor: only ever steps the pixel ratio DOWN (no oscillation) ----------
+// Add ?debug to the URL for a live fps / pixel-ratio / draw-call readout.
+let fAcc = 0, fN = 0, bad = 0;
+const dbg = location.search.includes('debug')
+  ? document.body.appendChild(Object.assign(document.createElement('div'), { id: 'dbg' })) : null;
+function monitor(dt, t) {
+  fAcc += dt; fN++;
+  if (fAcc < 1) return;                                  // evaluate once per second
+  const avg = (fAcc / fN) * 1000; fAcc = 0; fN = 0;
+  if (t > 3) {                                           // ignore warm-up (shader-compile hitches)
+    bad = avg > 22 ? bad + 1 : 0;                        // slower than ~45 fps
+    if (bad >= 2 && dpr > 1) { dpr = Math.max(1, dpr - 0.25); renderer.setPixelRatio(dpr); bad = 0; }
+  }
+  if (dbg) dbg.textContent = `${(1000 / avg).toFixed(0)} fps · dpr ${dpr.toFixed(2)} · ${renderer.info.render.calls} calls · ${(renderer.info.render.triangles / 1000).toFixed(1)}k tris`;
+}
+addEventListener('wheel', (e) => { camDist = THREE.MathUtils.clamp(camDist * (1 + e.deltaY * 0.001), 1.5, 9); }, { passive: true });
+
+const keys = new Set();
+let poseName = 'idle';
+addEventListener('keydown', (e) => {
+  if (e.code.startsWith('Arrow')) e.preventDefault();
+  keys.add(e.code);
+  if (e.repeat) return;
+  if (e.code === 'Digit1') poseName = 'idle';
+  if (e.code === 'Digit2') poseName = 'kneel';
+  if (e.code === 'Digit3') poseName = 'sit';
+  if (e.code === 'KeyG') triggerGust();
+});
+addEventListener('keyup', (e) => keys.delete(e.code));
+const down = (...codes) => codes.some(c => keys.has(c));
+
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.05), t = clock.elapsedTime;
+  monitor(dt, t);
+  tickWind(dt);
+
+  // input is relative to the camera: W walks away from it
+  const fx = -Math.sin(camYaw), fz = -Math.cos(camYaw);      // camera forward on the ground
+  const rx = Math.cos(camYaw), rz = -Math.sin(camYaw);       // camera right on the ground
+  const f = (down('KeyW', 'ArrowUp') ? 1 : 0) - (down('KeyS', 'ArrowDown') ? 1 : 0) - joy.y;   // stick up = forward
+  const r = (down('KeyD', 'ArrowRight') ? 1 : 0) - (down('KeyA', 'ArrowLeft') ? 1 : 0) + joy.x;
+  let dx = fx * f + rx * r, dz = fz * f + rz * r;
+  const len = Math.hypot(dx, dz);
+  if (len > 0) {
+    const m = Math.min(1, len) / len;        // keyboard = full speed; a partial stick tilt = a slower walk
+    dx *= m; dz *= m;
+    if (poseName !== 'idle') poseName = 'idle';   // walking stands her back up
+  }
+
+  character.update(dt, t, { x: dx, z: dz }, poseName);
+  const LIM = WORLD.half - WORLD.margin;                    // stay inside the walls
+  character.root.position.x = clamp(character.root.position.x, -LIM, LIM);
+  character.root.position.z = clamp(character.root.position.z, -LIM, LIM);
+
+  const p = character.root.position;
+  shadow.position.x = p.x; shadow.position.z = p.z; shadow.scale.setScalar(0.6 * character.P.sk[0]);
+  const k = 1 - Math.exp(-6 * dt);
+  camTarget.x += (p.x - camTarget.x) * k; camTarget.z += (p.z - camTarget.z) * k;
+  camTarget.y += ((poseName === 'idle' ? 1.0 : 0.75) - camTarget.y) * k;
+  camera.position.set(
+    camTarget.x + Math.sin(camYaw) * Math.cos(camPitch) * camDist,
+    camTarget.y + Math.sin(camPitch) * camDist,
+    camTarget.z + Math.cos(camYaw) * Math.cos(camPitch) * camDist);
+  camera.lookAt(camTarget);
+  env.sky.position.copy(camera.position);
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>
