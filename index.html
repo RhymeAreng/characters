@@ -697,18 +697,53 @@ function buildCharacter() {
 // =====================================================================
 
 // =====================================================================
-// ==== ENV START — vihara courtyard at golden hour. The character never reads this block.
+// ==== ENV START — vihara courtyard at golden hour + walkable areas. The character never reads this block.
 // =====================================================================
-// Courtyard is 14 x 14 m, centred on the origin. +z is the way she faces (prayer hall goes there later).
-const WORLD = { half: 7, margin: 0.6 };
+// Top-down (she faces +z; the hall is at the back, the gate at the front):
+//   courtyard  x -13..13, z -7..13   (26 x 20 m)         path  x -1.5..1.5, z -34..-7 (outside the gate)
+// To resize the courtyard change WORLD (keep x0 = -x1). To add areas, add a rectangle to WALK_RECTS.
+const WORLD = { x0: -13, x1: 13, z0: -7, z1: 13, gate: 1.2 };     // gate = half-width of the opening
+const PATH  = { halfW: 1.5, z0: -34 };                            // approach path outside the gate
+const WALK_MARGIN = 0.6;                                          // her centre stays this far from walls and blockers
+
+// Places her CENTRE may stand. Already inset by the margin, so there is no extra maths per frame.
+const WALK_RECTS = [
+  { x0: WORLD.x0 + WALK_MARGIN, x1: WORLD.x1 - WALK_MARGIN, z0: WORLD.z0 + WALK_MARGIN, z1: WORLD.z1 - WALK_MARGIN },  // courtyard
+  { x0: -1.0, x1: 1.0, z0: PATH.z0 + WALK_MARGIN, z1: WORLD.z0 + WALK_MARGIN + 0.6 },                                 // path + gate (overlaps the courtyard by 0.6 m)
+];
+// Boxes she cannot enter (visual size; inflated by the margin when tested). Add the pond, candle stands, etc. here later.
+const BLOCKERS = [
+  { name: 'hall', x0: -5.2, x1: 5.2, z0: 5.9, z1: 13 },
+];
+
+// Call once per frame with character.root.position: keeps her inside the walkable rectangles and out of blockers.
+function constrainWalk(pos) {
+  for (let pass = 0; pass < 2; pass++) {
+    // 1) inside the union of walkable rectangles: if outside all of them, snap to the nearest point of the nearest one
+    let bx = pos.x, bz = pos.z, bd = Infinity;
+    for (const r of WALK_RECTS) {
+      const cx = Math.min(r.x1, Math.max(r.x0, pos.x)), cz = Math.min(r.z1, Math.max(r.z0, pos.z));
+      const d = (cx - pos.x) * (cx - pos.x) + (cz - pos.z) * (cz - pos.z);
+      if (d < bd) { bd = d; bx = cx; bz = cz; }
+    }
+    pos.x = bx; pos.z = bz;
+    // 2) pushed out of any blocker the shortest way (so she slides along its edge instead of sticking)
+    for (const b of BLOCKERS) {
+      const x0 = b.x0 - WALK_MARGIN, x1 = b.x1 + WALK_MARGIN, z0 = b.z0 - WALK_MARGIN, z1 = b.z1 + WALK_MARGIN;
+      if (pos.x > x0 && pos.x < x1 && pos.z > z0 && pos.z < z1) {
+        const dl = pos.x - x0, dr = x1 - pos.x, df = pos.z - z0, db = z1 - pos.z, m = Math.min(dl, dr, df, db);
+        if (m === dl) pos.x = x0; else if (m === dr) pos.x = x1; else if (m === df) pos.z = z0; else pos.z = z1;
+      }
+    }
+  }
+}
 
 function buildEnvironment(scene) {
   const HORIZON = '#f2cfa0';
+  const { x0, x1, z0, z1, gate } = WORLD;
+  const W = x1 - x0, D = z1 - z0, cx = (x0 + x1) / 2, cz = (z0 + z1) / 2;
 
   // ---- sky dome: vertical gradient, follows the camera so it never shows an edge ----
-  // A sphere's v runs 0 (bottom pole) -> 1 (top pole), so the horizon sits at canvas y = 0.5 and
-  // each degree of elevation is 1/180 of the canvas. The camera only sees about 0-40 degrees up,
-  // so the whole warm-to-cool change is packed into canvas y 0.28 - 0.5 where it is actually visible.
   const skyTex = canvasTex(8, 256, (g, w, h) => {
     const gr = g.createLinearGradient(0, 0, 0, h);
     [[0, '#26305a'], [0.15, '#3b4a7a'], [0.28, '#5f6c9e'], [0.34, '#9a7fa8'], [0.40, '#e09a6e'], [0.45, '#f5c08a'], [0.5, HORIZON], [1, HORIZON]]
@@ -721,7 +756,7 @@ function buildEnvironment(scene) {
   sky.renderOrder = -1;
   scene.add(sky);
   scene.background = new THREE.Color(HORIZON);
-  scene.fog = new THREE.Fog(HORIZON, 14, 48);
+  scene.fog = new THREE.Fog(HORIZON, 26, 75);                       // pushed out: the world is bigger now
 
   // ---- lighting (no shadow maps: phones can't afford them) ----
   scene.add(new THREE.HemisphereLight(0xffe2b8, 0x5a4a3a, 1.2));
@@ -729,10 +764,10 @@ function buildEnvironment(scene) {
   sun.position.set(4, 5, -6);            // behind + right of the camera, so her back is lit
   scene.add(sun);
 
-  // ---- ground ----
-  const outer = new THREE.Mesh(new THREE.PlaneGeometry(200, 200), toon('#9a8a5a'));
-  outer.rotation.x = -Math.PI / 2;
-  scene.add(outer);
+  // ---- ground: the outer plane follows the player (see the animation loop), so its edge is never reached ----
+  const ground = new THREE.Mesh(new THREE.PlaneGeometry(200, 200), toon('#9a8a5a'));
+  ground.rotation.x = -Math.PI / 2;
+  scene.add(ground);
 
   const hsh = (i, j) => { const s = Math.sin(i * 12.9898 + j * 78.233) * 43758.5453; return s - Math.floor(s); };
   const pavingTex = canvasTex(512, 512, (g, w, h) => {
@@ -747,13 +782,21 @@ function buildEnvironment(scene) {
       g.fillRect(k * slab - 1.5, 0, 3, h);
       g.fillRect(0, k * slab - 1.5, w, 3);
     }
-  }, 3.5);                                                            // 14 m / 3.5 = 4 m per tile = 1 m slabs
-  const paving = new THREE.Mesh(new THREE.PlaneGeometry(14, 14), toon(0xffffff, { map: pavingTex }));
+  }, 1);
+  pavingTex.repeat.set(W / 4, D / 4);                                 // one texture tile = 4 m = 4 slabs, so slabs stay 1 m
+  const paving = new THREE.Mesh(new THREE.PlaneGeometry(W, D), toon(0xffffff, { map: pavingTex }));
   paving.rotation.x = -Math.PI / 2;
-  paving.position.y = 0.004;
+  paving.position.set(cx, 0.004, cz);
   scene.add(paving);
 
-  // ---- perimeter wall: knee-high, whitewashed, 2.4 m gate gap on the -z side ----
+  // ---- approach path outside the gate (plain packed earth for now; the trees come in the next step) ----
+  const pathLen = z0 - PATH.z0;
+  const pathMesh = new THREE.Mesh(new THREE.PlaneGeometry(PATH.halfW * 2, pathLen + 0.3), toon('#b9a577'));
+  pathMesh.rotation.x = -Math.PI / 2;
+  pathMesh.position.set(0, 0.003, z0 - pathLen / 2 + 0.15);
+  scene.add(pathMesh);
+
+  // ---- perimeter wall: knee-high, whitewashed, with a gate gap in the front (-z) wall ----
   const mWall = toon('#e8dcc4'), mPost = toon('#6b3f2a');
   const box = (w, h, d, x, y, z, mat) => {
     const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
@@ -761,21 +804,22 @@ function buildEnvironment(scene) {
     scene.add(m);
     return m;
   };
-  const H = WORLD.half, T = 0.3, WH = 0.5, GAP = 1.2;               // GAP = half the gate opening
-  box(2 * H + T, WH, T, 0, WH / 2, +H, mWall);                        // back wall (+z)
-  box(T, WH, 2 * H + T, -H, WH / 2, 0, mWall);                        // left wall
-  box(T, WH, 2 * H + T, +H, WH / 2, 0, mWall);                        // right wall
-  const start = GAP + 0.3, frontLen = H - start;                      // wall starts 0.3 m in, hidden inside the post
-  box(frontLen, WH, T, -(start + frontLen / 2), WH / 2, -H, mWall);   // front wall, left of the gate
-  box(frontLen, WH, T, +(start + frontLen / 2), WH / 2, -H, mWall);   // front wall, right of the gate
-  box(0.35, 1.2, 0.35, -(GAP + 0.175), 0.6, -H, mPost);               // gate posts
-  box(0.35, 1.2, 0.35, +(GAP + 0.175), 0.6, -H, mPost);
+  const T = 0.3, WH = 0.5;
+  box(W + T, WH, T, cx, WH / 2, z1, mWall);                           // back wall (+z)
+  box(T, WH, D + T, x0, WH / 2, cz, mWall);                           // left wall
+  box(T, WH, D + T, x1, WH / 2, cz, mWall);                           // right wall
+  const start = gate + 0.3, frontLen = x1 - start;                    // front pieces start 0.3 m inside the post (no coplanar faces)
+  box(frontLen, WH, T, -(start + frontLen / 2), WH / 2, z0, mWall);   // front wall, left of the gate
+  box(frontLen, WH, T, +(start + frontLen / 2), WH / 2, z0, mWall);   // front wall, right of the gate
+  box(0.35, 1.2, 0.35, -(gate + 0.175), 0.6, z0, mPost);              // gate posts
+  box(0.35, 1.2, 0.35, +(gate + 0.175), 0.6, z0, mPost);
 
-  return { sky };
+  return { sky, ground };                                             // ground is new: the loop moves it with her
 }
 // =====================================================================
 // ==== ENV END
 // =====================================================================
+
 
 // =====================================================================
 // ==== MONASTERY START — purple-and-gold vihara hall (static; merged into ~7 meshes)
@@ -1022,11 +1066,12 @@ document.body.appendChild(renderer.domElement);
 const scene = new THREE.Scene();
 const env = buildEnvironment(scene);
 const monastery = buildMonastery();
-monastery.group.position.set(0, 0, 4.3);
+monastery.group.position.set(0, 0, 10.2);
 scene.add(monastery.group);
 
 const character = buildCharacter(); scene.add(character.root);
-character.root.position.set(0, 0, -4.5);   // start just inside the gate
+const START_Z = -33;                          // where she begins on the path (gate is at z = -7)
+character.root.position.set(0, 0, START_Z);
 window.character = character;   // handy for poking around in the console
 
 const shadow = new THREE.Mesh(new THREE.CircleGeometry(0.5, 32),
@@ -1035,7 +1080,7 @@ shadow.rotation.x = -Math.PI / 2; shadow.position.y = 0.01; scene.add(shadow);
 
 const camera = new THREE.PerspectiveCamera(40, innerWidth / innerHeight, 0.1, 100);
 let camYaw = Math.PI, camPitch = 0.22, camDist = 4.2;       // yaw = PI puts the camera behind her (she faces +z)
-const camTarget = new THREE.Vector3(0, 1.0, -4.5);
+const camTarget = new THREE.Vector3(0, 1.0, START_Z);
 
 addEventListener('resize', () => {
   renderer.setSize(innerWidth, innerHeight);
@@ -1155,9 +1200,7 @@ renderer.setAnimationLoop(() => {
   }
 
   character.update(dt, t, { x: dx, z: dz }, poseName);
-  const LIM = WORLD.half - WORLD.margin;                    // stay inside the walls
-  character.root.position.x = clamp(character.root.position.x, -LIM, LIM);
-  character.root.position.z = clamp(character.root.position.z, -LIM, LIM);
+  constrainWalk(character.root.position);                  // walls, hall, gate path
 
   const p = character.root.position;
   shadow.position.x = p.x; shadow.position.z = p.z; shadow.scale.setScalar(0.6 * character.P.sk[0]);
@@ -1170,6 +1213,7 @@ renderer.setAnimationLoop(() => {
     camTarget.z + Math.cos(camYaw) * Math.cos(camPitch) * camDist);
   camera.lookAt(camTarget);
   env.sky.position.copy(camera.position);
+  env.ground.position.set(p.x, 0, p.z);                       // ground follows her: no edge to walk off
   renderer.render(scene, camera);
 });
 </script>
